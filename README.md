@@ -1,2 +1,2 @@
-# ReinClothPlugin
+# ReinCloth
 叡智でえっちなクロスシミュレーション
