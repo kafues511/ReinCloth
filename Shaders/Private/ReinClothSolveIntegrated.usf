@@ -1,0 +1,438 @@
+// Copyright © 2026 kafues511 All Rights Reserved.
+
+#include "ReinClothCommon.ush"
+
+#define THREADGROUP_SIZEX (1024)
+
+float DeltaTime;
+float InvDeltaTime;
+float InvDeltaTimeSq;
+
+uint NumSettleIterations;
+uint NumSubsteps;
+
+uint NumPositions;
+uint NumEmbeddeds;
+uint MaxEmbeddedsPerPosition;
+uint NumCollisions;
+
+float VelocityDamping;
+float3 Gravity;
+
+float StructuralVerticalCompliance;
+float StructuralHorizontalCompliance;
+float ShearCompliance;
+float BendingVerticalCompliance;
+float BendingHorizontalCompliance;
+
+float MaxDisplacement;
+
+float4x4 RenderMatrix;
+
+RWStructuredBuffer<float4> PositionUAV;  // xyz: pos, w: inv mass
+RWStructuredBuffer<float4> VelocityUAV;  // xyz: vel, w: pad
+
+StructuredBuffer<uint> OffsetSRV;
+StructuredBuffer<uint> NeighborSRV;
+StructuredBuffer<FReinClothConstraint> ConstraintSRV;
+
+StructuredBuffer<float4> OriginSRV;  // xyz: origin, w: pad
+StructuredBuffer<FReinClothInfluence> InfluenceSRV;
+StructuredBuffer<FReinClothMatrix3x4> BoneMatrixSRV;
+
+StructuredBuffer<FReinClothCollision> CollisionSRV;
+
+StructuredBuffer<uint> NormalOffsetSRV;
+StructuredBuffer<uint> NormalNeighborSRV;
+
+StructuredBuffer<FReinClothEmbedded> EmbeddedSRV;
+StructuredBuffer<FReinClothInfluence> EmbeddedInfluenceSRV;
+
+RWTexture2D<float4> PositionTextureUAV;
+RWTexture2D<float4> NormalTextureUAV;
+
+groupshared float4 SharedPredict[1024];
+groupshared float4 SharedNormal[1024];
+
+#define SharedPosition (SharedPredict)
+
+float3x4 GetBoneMatrix(uint Index)
+{
+	FReinClothMatrix3x4 Mat = BoneMatrixSRV[Index];
+	return float3x4(Mat.M00, Mat.M10, Mat.M20);
+}
+
+float3x4 ComputeBoneMatrixWithLimitedInfluences(FReinClothInfluence Influence)
+{
+	float3x4 BoneMatrix;
+	BoneMatrix  = GetBoneMatrix(Influence.Bones.x) * Influence.Weights.x;
+	BoneMatrix += GetBoneMatrix(Influence.Bones.y) * Influence.Weights.y;
+	BoneMatrix += GetBoneMatrix(Influence.Bones.z) * Influence.Weights.z;
+	BoneMatrix += GetBoneMatrix(Influence.Bones.w) * Influence.Weights.w;
+#if 1
+	// todo: Extraはバリエーション設けて最適化したいが、稀に狂ったほどウェイト設定されている個体があるから一旦常駐
+	BoneMatrix += GetBoneMatrix(Influence.ExtraBones.x) * Influence.ExtraWeights.x;
+	BoneMatrix += GetBoneMatrix(Influence.ExtraBones.y) * Influence.ExtraWeights.y;
+	BoneMatrix += GetBoneMatrix(Influence.ExtraBones.z) * Influence.ExtraWeights.z;
+	BoneMatrix += GetBoneMatrix(Influence.ExtraBones.w) * Influence.ExtraWeights.w;
+#endif
+	return BoneMatrix;
+}
+
+[numthreads(THREADGROUP_SIZEX, 1, 1)]
+void MainCS(uint3 GroupId : SV_GroupID, uint GroupThreadIndex : SV_GroupIndex)
+{
+	uint BatchIndex = GetUnWrappedDispatchThreadId(GroupId, GroupThreadIndex, THREADGROUP_SIZEX);
+
+	float4 Position = (float4)0;
+	float4 Predict = (float4)0;
+	float4 Velocity = (float4)0;
+
+	uint Start = 0u;
+	uint End = 0u;
+	uint NeighborCount = 0u;
+	uint PackedNeighbor[12];
+
+	float4 Origin = (float4)0;
+	FReinClothInfluence Influence = (FReinClothInfluence)0;
+	float3x4 BoneMatrix = (float3x4)0;
+
+	bool bIsValid = BatchIndex < NumPositions;
+
+	BRANCH
+	if (bIsValid)
+	{
+		Position = Predict = PositionUAV[BatchIndex];
+		Velocity = VelocityUAV[BatchIndex];
+
+		Start = OffsetSRV[BatchIndex];
+		End = OffsetSRV[BatchIndex + 1];
+		NeighborCount = End - Start;
+
+		Origin = OriginSRV[BatchIndex];
+		Influence = InfluenceSRV[BatchIndex];
+		BoneMatrix = ComputeBoneMatrixWithLimitedInfluences(Influence);
+
+		GetOrigin(Origin) = mul(BoneMatrix,   float4(GetOrigin(Origin), 1.0)).xyz;
+		GetOrigin(Origin) = mul(RenderMatrix, float4(GetOrigin(Origin), 1.0)).xyz;
+
+	#if RESET_SIMULATION == 0
+		if (GetInvMass(Predict) <= 0.0)
+	#endif  // RESET_SIMULATION
+		{
+			GetPosition(Position) = GetOrigin(Origin);
+			GetVelocity(Velocity) = (float3)0;
+		}
+
+		GetPredict(Predict) = GetPosition(Position);
+	}
+
+	UNROLL
+	for (uint Index = 0u; Index < 12u; ++Index)
+	{
+		uint LocalIndex = Start + Index;
+		FLATTEN
+		if (bIsValid && LocalIndex < End)
+		{
+			PackedNeighbor[Index] = NeighborSRV[LocalIndex];
+		}
+		else
+		{
+			PackedNeighbor[Index] = 0xFFFFFFFF;
+		}
+	}
+
+	// 有効性判断に質量を追加
+	bIsValid = bIsValid && GetInvMass(Predict) > 0.0;
+
+#if REQUEST_SETTLE == 1
+	LOOP
+	for (uint Iter = 0u; Iter < NumSettleIterations; ++Iter)
+	{
+#endif  // REQUEST_SETTLE
+
+	LOOP
+	for (uint Substep = 0u; Substep < NumSubsteps; ++Substep)
+	{
+		// -----------------------
+		// PreSolve
+		// -----------------------
+
+		BRANCH
+		if (bIsValid)
+		{
+			// 速度更新
+			GetVelocity(Velocity) += DeltaTime * Gravity;
+
+			// 予測位置の更新
+			GetPredict(Predict) = GetPosition(Position);
+			GetPredict(Predict) += DeltaTime * VelocityDamping * GetVelocity(Velocity);
+		}
+
+		SharedPredict[BatchIndex] = Predict;
+
+		GroupMemoryBarrierWithGroupSync();
+
+		// -----------------------
+		// SolveConstraintGather
+		// -----------------------
+
+		float3 PredictDelta = (float3)0;
+
+		BRANCH
+		if (bIsValid)
+		{
+			UNROLL
+			for (uint Index = 0u; Index < 12u; ++Index)
+			{
+				uint PackedData = PackedNeighbor[Index];
+				if (PackedData == 0xFFFFFFFF)
+				{
+					break;
+				}
+
+				uint ConstraintIdx = PackedData >> 2;
+				uint LocalIdx = PackedData & 0x3; // 自分が Ids[0] か Ids[1] か
+
+				FReinClothConstraint Constraint = ConstraintSRV[ConstraintIdx];
+
+			#if 1
+				float Compliance;
+				switch (Constraint.Type)
+				{
+				case REIN_CLOTH_CONSTRAIN_TYPES_STRUCTURAL_VERTICAL:
+					Compliance = StructuralVerticalCompliance;
+					break;
+				case REIN_CLOTH_CONSTRAIN_TYPES_STRUCTURAL_HORIZONTAL:
+					Compliance = StructuralHorizontalCompliance;
+					break;
+				case REIN_CLOTH_CONSTRAIN_TYPES_SHEAR:
+					Compliance = ShearCompliance;
+					break;
+				case REIN_CLOTH_CONSTRAIN_TYPES_BENDING_VERTICAL:
+					Compliance = BendingVerticalCompliance;
+					break;
+				case REIN_CLOTH_CONSTRAIN_TYPES_BENDING_HORIZONTAL:
+					Compliance = BendingHorizontalCompliance;
+					break;
+				case REIN_CLOTH_CONSTRAIN_TYPES_BENDING_EXTRA:
+					Compliance = BendingVerticalCompliance;
+					break;
+				default:
+					Compliance = 0.0;
+					break;
+				}
+			#else
+				// todo: uint Type を float Compliance に置き換えた最適化バリエーションがほしい気持ちではある
+				float Compliance = asfloat(Constraint.Type);
+			#endif
+
+				float4 Predict01 = SharedPredict[Constraint.Ids[1 - LocalIdx]];
+				float4 Predict0 = (LocalIdx == 0) ? Predict : Predict01;
+				float4 Predict1 = (LocalIdx == 1) ? Predict : Predict01;
+
+				float Alpha = Compliance * InvDeltaTimeSq;
+				float Weight = GetInvMass(Predict0) + GetInvMass(Predict1);
+				float InvWeight = (Weight + Alpha > 0.0) ? rcp(Weight + Alpha) : 0.0;
+
+				float3 Diff = GetPredict(Predict0) - GetPredict(Predict1);
+				float DiffSq = SizeSquared(Diff);
+
+				float InvLen = rsqrt(DiffSq + 1.0e-9);
+				float Len = DiffSq * InvLen;
+				float Grad = Len - Constraint.EdgeLength;
+				float Corr = -Grad * InvWeight * InvLen;
+
+				FLATTEN
+				if (LocalIdx == 0)
+				{
+					PredictDelta += Corr * Diff * GetInvMass(Predict0);
+				}
+				else
+				{
+					PredictDelta += -Corr * Diff * GetInvMass(Predict1);
+				}
+			}
+		}
+
+		// -----------------------
+		// PostSolve
+		// -----------------------
+
+		BRANCH
+		if (bIsValid)
+		{
+		#if ENABLE_SOFT_COLLISION
+			LOOP
+			for (uint Index = 0u; Index < NumCollisions; ++Index)
+			{
+				FReinClothCollision Collision = CollisionSRV[Index];
+
+				float3 AB = Collision.CapsuleEnd - Collision.CapsuleStart;
+				float3 AP = GetPredict(Predict) - Collision.CapsuleStart;
+				float t = saturate(dot(AP, AB) / SizeSquared(AB));
+				float3 Q = Collision.CapsuleStart + t * AB;
+
+				float3 Diff = GetPredict(Predict) - Q;
+				float DistSq = SizeSquared(Diff);
+				float CombinedRadius = Collision.Radius + 0.1;  // todo: 微動するからマージン設けてる, あとでパラメタ化
+
+				FLATTEN
+				if (DistSq < CombinedRadius * CombinedRadius)
+				{
+					float InvDist = rsqrt(DistSq + 1e-9);
+					float3 NormalDir = Diff * InvDist;
+
+					float3 CollisionDelta = (Q + NormalDir * Collision.Radius) - GetPosition(Position);
+					float NormalDelta = dot(CollisionDelta, NormalDir);
+					float3 TangentDelta = (CollisionDelta - NormalDir * NormalDelta) * (1.0 - Collision.Friction);
+
+					float3 TargetPredict = GetPosition(Position) + NormalDir * NormalDelta + TangentDelta;
+					PredictDelta += TargetPredict - GetPredict(Predict);
+				}
+			}
+		#endif  // ENABLE_SOFT_COLLISION
+
+			// 移動量の制限
+			FLATTEN
+			if (SizeSquared(PredictDelta) > MaxDisplacement * MaxDisplacement)
+			{
+				PredictDelta = GetSafeNormal(PredictDelta) * MaxDisplacement;
+			}
+
+			// 予測位置の更新
+			float PredictDeltaDecay = (NeighborCount > 0u) ? rcp(float(NeighborCount)) : 0.0;
+			GetPredict(Predict) += PredictDelta * PredictDeltaDecay;
+
+		#if ENABLE_HARD_COLLISION
+			LOOP
+			for (uint Index = 0u; Index < NumCollisions; ++Index)
+			{
+				FReinClothCollision Collision = CollisionSRV[Index];
+
+				float3 AB = Collision.CapsuleEnd - Collision.CapsuleStart;
+				float3 AP = GetPredict(Predict) - Collision.CapsuleStart;
+				float t = saturate(dot(AP, AB) / SizeSquared(AB));
+				float3 Q = Collision.CapsuleStart + t * AB;
+
+				float3 Diff = GetPredict(Predict) - Q;
+				float DistSq = SizeSquared(Diff);
+				float CombinedRadius = Collision.Radius;
+
+				FLATTEN
+				if (DistSq < CombinedRadius * CombinedRadius)
+				{
+					float InvDist = rsqrt(DistSq + 1e-9);
+					float3 NormalDir = Diff * InvDist;
+
+					float3 CollisionDelta = (Q + NormalDir * Collision.Radius) - GetPosition(Position);
+					float NormalDelta = dot(CollisionDelta, NormalDir);
+					float3 TangentDelta = (CollisionDelta - NormalDir * NormalDelta) * (1.0 - Collision.Friction);
+
+					GetPredict(Predict) = GetPosition(Position) + NormalDir * NormalDelta + TangentDelta;
+				}
+			}
+		#endif  // ENABLE_HARD_COLLISION
+
+			// 速度更新
+			GetVelocity(Velocity) = (GetPredict(Predict) - GetPosition(Position)) * InvDeltaTime;
+
+			// 位置の更新
+			GetPosition(Position) = GetPredict(Predict);
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+	}
+
+#if REQUEST_SETTLE == 1
+	}
+#endif  // REQUEST_SETTLE
+
+	// note: InvMass=0.0も処理しないと後続の埋め込みの座標で不具合起きる
+	BRANCH
+	if (BatchIndex < NumPositions)
+	{
+		PositionUAV[BatchIndex] = Position;
+		VelocityUAV[BatchIndex] = Velocity;
+		SharedPosition[BatchIndex] = Position;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	BRANCH
+	if (BatchIndex < NumPositions)
+	{
+		// todo: 時間取れたら NormalOffsetSRV と NormalNeighborSRV のフェッチを前方にお引越しして差分計測
+		float3 VertexNormal = (float3)0;
+		uint NormalStart = NormalOffsetSRV[BatchIndex];
+		uint NormalEnd = NormalOffsetSRV[BatchIndex + 1];
+
+		LOOP
+		for (uint Index = NormalStart; Index < NormalEnd; ++Index)
+		{
+			uint PackedData = NormalNeighborSRV[Index];
+			uint Index1 = PackedData & 0xFFFF;
+			uint Index2 = PackedData >> 16;
+
+			float3 Position1 = GetPredict(SharedPosition[Index1]);
+			float3 Position2 = GetPredict(SharedPosition[Index2]);
+
+			VertexNormal += cross(Position2 - GetPosition(Position), Position1 - GetPosition(Position));
+		}
+
+		SharedNormal[BatchIndex] = float4(GetSafeNormal(VertexNormal), 1.0);
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	BRANCH
+	if (BatchIndex < NumPositions)
+	{
+		LOOP
+		for (uint Offset = 0u; Offset < MaxEmbeddedsPerPosition; ++Offset)
+		{
+			uint EmbeddedIndex = BatchIndex * MaxEmbeddedsPerPosition + Offset;
+			if (EmbeddedIndex >= NumEmbeddeds)
+			{
+				break;
+			}
+
+			FReinClothEmbedded Embedded = EmbeddedSRV[EmbeddedIndex];
+			float3 Position0 = GetPosition(SharedPosition[Embedded.Ids.x]);
+			float3 Position1 = GetPosition(SharedPosition[Embedded.Ids.y]);
+			float3 Position2 = GetPosition(SharedPosition[Embedded.Ids.z]);
+
+			float3 EmbeddedOffset = (float3)0;
+		#if REIN_CLOTH_EMBEDDED_OFFSET_REST
+			FReinClothInfluence EmbeddedInfluence = EmbeddedInfluenceSRV[EmbeddedIndex];
+			float3x4 EmbeddedBoneMatrix = ComputeBoneMatrixWithLimitedInfluences(EmbeddedInfluence);
+
+			EmbeddedOffset = Embedded.Offset;
+			EmbeddedOffset = mul((float3x3)EmbeddedBoneMatrix, EmbeddedOffset).xyz;
+			EmbeddedOffset = mul((float3x3)RenderMatrix,       EmbeddedOffset).xyz;
+		#else  // REIN_CLOTH_EMBEDDED_OFFSET_REST
+			float3 EmbeddedTangent = GetSafeNormal(Position1 - Position0);
+			float3 EmbeddedNormal = GetSafeNormal(cross(Position1 - Position0, Position2 - Position0));
+			float3 EmbeddedBitangent = cross(EmbeddedNormal, EmbeddedTangent);
+
+			EmbeddedOffset += EmbeddedTangent * Embedded.Offset.x;
+			EmbeddedOffset += EmbeddedBitangent * Embedded.Offset.y;
+			EmbeddedOffset += EmbeddedNormal * Embedded.Offset.z;
+		#endif  // REIN_CLOTH_EMBEDDED_OFFSET_REST
+
+			float3 EmbeddedPosition = (float3)0;
+			EmbeddedPosition += Position0 * Embedded.Weights.x;
+			EmbeddedPosition += Position1 * Embedded.Weights.y;
+			EmbeddedPosition += Position2 * Embedded.Weights.z;
+			EmbeddedPosition += EmbeddedOffset;
+
+			float3 EmbeddedVertexNormal = (float3)0;
+			EmbeddedVertexNormal += GetNormal(SharedNormal[Embedded.Ids.x]) * Embedded.Weights.x;
+			EmbeddedVertexNormal += GetNormal(SharedNormal[Embedded.Ids.y]) * Embedded.Weights.y;
+			EmbeddedVertexNormal += GetNormal(SharedNormal[Embedded.Ids.z]) * Embedded.Weights.z;
+
+			PositionTextureUAV[Embedded.UV] = float4(EmbeddedPosition, 1.0);
+			NormalTextureUAV[Embedded.UV] = float4(GetSafeNormal(EmbeddedVertexNormal), 1.0);
+		}
+	}
+}

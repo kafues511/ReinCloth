@@ -1,0 +1,82 @@
+// Copyright © 2026 kafues511 All Rights Reserved.
+
+#pragma once
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ComputeShaderUtils.ush"
+
+#define REIN_CLOTH_CONSTRAIN_TYPES_STRUCTURAL_VERTICAL (0)		// 構造バネ（垂直）
+#define REIN_CLOTH_CONSTRAIN_TYPES_STRUCTURAL_HORIZONTAL (1)	// 構造バネ（水平）
+#define REIN_CLOTH_CONSTRAIN_TYPES_SHEAR (2)					// せん断バネ
+#define REIN_CLOTH_CONSTRAIN_TYPES_BENDING_VERTICAL (3)			// 曲げバネ（垂直）
+#define REIN_CLOTH_CONSTRAIN_TYPES_BENDING_HORIZONTAL (4)		// 曲げバネ（水平）
+#define REIN_CLOTH_CONSTRAIN_TYPES_BENDING_EXTRA (5)			// 異なるパーツ間の曲げバネ, todo: VERTICALとHORIZONTALに分割
+
+#define GetPosition(Value) Value.xyz
+#define GetPredict(Value) Value.xyz
+#define GetInvMass(Value) Value.w
+#define GetVelocity(Value) Value.xyz
+#define GetNormal(Value) Value.xyz
+#define GetOrigin(Value) Value.xyz
+
+#define SizeSquared(Value) dot(Value, Value)
+
+struct FReinClothMatrix3x4
+{
+	float4 M00;
+	float4 M10;
+	float4 M20;
+};
+
+struct FReinClothInfluence
+{
+	uint4 Bones;
+	float4 Weights;
+	uint4 ExtraBones;
+	float4 ExtraWeights;
+};
+
+// note: カプセル以外のコリジョンを分岐で選べるようにすると処理速度が顕著に落ちるから、絶対にカプセル以外を追加しないで
+struct FReinClothCollision
+{
+	float3 CapsuleStart;
+	float3 CapsuleEnd;
+	float Radius;
+	float Friction;
+};
+
+struct FReinClothConstraint
+{
+	uint Type;
+	uint2 Ids;
+	float EdgeLength;
+};
+
+struct FReinClothEmbedded
+{
+	uint3 Ids;
+	float3 Weights;
+	float3 Offset;
+	uint2 UV;
+	float Pad;
+};
+
+float3 GetSafeNormal(float3 Value)
+{
+	float SquareSum = SizeSquared(Value);
+
+	// Not sure if it's safe to add tolerance in there. Might introduce too many errors
+	if (SquareSum == 1.0)
+	{
+		return Value;
+	}
+	else if (SquareSum < 1.0e-8)
+	{
+		return float3(0.0, 0.0, 0.0);
+	}
+	else
+	{
+		float Scale = rsqrt(SquareSum);
+		return Value * Scale;
+	}
+}

@@ -1,0 +1,101 @@
+// Copyright © 2026 kafues511 All Rights Reserved.
+
+#include "ReinClothCommon.ush"
+
+float3 Color;
+float4x4 RenderMatrix;
+
+StructuredBuffer<float4> PositionSRV;	// xyz: pos, w: inv mass
+StructuredBuffer<uint4> TriangleSRV;	// xyz: index, w: pad
+StructuredBuffer<FReinClothInfluence> InfluenceSRV;
+StructuredBuffer<FReinClothMatrix3x4> BoneMatrixSRV;
+StructuredBuffer<FReinClothEmbedded> EmbeddedSRV;
+StructuredBuffer<FReinClothInfluence> EmbeddedInfluenceSRV;
+
+float3x4 GetBoneMatrix(uint Index)
+{
+	FReinClothMatrix3x4 Mat = BoneMatrixSRV[Index];
+	return float3x4(Mat.M00, Mat.M10, Mat.M20);
+}
+
+float3x4 ComputeBoneMatrixWithLimitedInfluences(FReinClothInfluence Influence)
+{
+	float3x4 BoneMatrix;
+	BoneMatrix  = GetBoneMatrix(Influence.Bones.x) * Influence.Weights.x;
+	BoneMatrix += GetBoneMatrix(Influence.Bones.y) * Influence.Weights.y;
+	BoneMatrix += GetBoneMatrix(Influence.Bones.z) * Influence.Weights.z;
+	BoneMatrix += GetBoneMatrix(Influence.Bones.w) * Influence.Weights.w;
+	BoneMatrix += GetBoneMatrix(Influence.ExtraBones.x) * Influence.ExtraWeights.x;
+	BoneMatrix += GetBoneMatrix(Influence.ExtraBones.y) * Influence.ExtraWeights.y;
+	BoneMatrix += GetBoneMatrix(Influence.ExtraBones.z) * Influence.ExtraWeights.z;
+	BoneMatrix += GetBoneMatrix(Influence.ExtraBones.w) * Influence.ExtraWeights.w;
+	return BoneMatrix;
+}
+
+#if REIN_CLOTH_VISUALIZE_VS
+
+void MainVS(
+	in uint VertexID : SV_VertexID
+	, out float4 OutPosition : SV_POSITION
+)
+{
+	ResolvedView = ResolveView();
+
+	uint TriangleID = VertexID / 3;
+	uint ComponentID = VertexID % 3;
+	uint BatchIndex = TriangleSRV[TriangleID][ComponentID];
+
+#if VISUALIZE_RENDER_MESH == 1
+	FReinClothEmbedded Embedded = EmbeddedSRV[BatchIndex];
+	float3 Position0 = GetPosition(PositionSRV[Embedded.Ids.x]);
+	float3 Position1 = GetPosition(PositionSRV[Embedded.Ids.y]);
+	float3 Position2 = GetPosition(PositionSRV[Embedded.Ids.z]);
+
+	float3 EmbeddedOffset = (float3)0;
+#if REIN_CLOTH_EMBEDDED_OFFSET_REST
+	FReinClothInfluence EmbeddedInfluence = EmbeddedInfluenceSRV[BatchIndex];
+	float3x4 EmbeddedBoneMatrix = ComputeBoneMatrixWithLimitedInfluences(EmbeddedInfluence);
+
+	EmbeddedOffset = Embedded.Offset;
+	EmbeddedOffset = mul((float3x3)EmbeddedBoneMatrix, EmbeddedOffset).xyz;
+	EmbeddedOffset = mul((float3x3)RenderMatrix,       EmbeddedOffset).xyz;
+#else  // REIN_CLOTH_EMBEDDED_OFFSET_REST
+	float3 EmbeddedTangent = GetSafeNormal(Position1 - Position0);
+	float3 EmbeddedNormal = GetSafeNormal(cross(Position1 - Position0, Position2 - Position0));
+	float3 EmbeddedBitangent = cross(EmbeddedNormal, EmbeddedTangent);
+
+	EmbeddedOffset += EmbeddedTangent * Embedded.Offset.x;
+	EmbeddedOffset += EmbeddedBitangent * Embedded.Offset.y;
+	EmbeddedOffset += EmbeddedNormal * Embedded.Offset.z;
+#endif  // REIN_CLOTH_EMBEDDED_OFFSET_REST
+
+	float3 Position = (float3)0;
+	Position += Position0 * Embedded.Weights.x;
+	Position += Position1 * Embedded.Weights.y;
+	Position += Position2 * Embedded.Weights.z;
+	Position += EmbeddedOffset;
+#else  // VISUALIZE_RENDER_MESH
+	float3 Position = GetPosition(PositionSRV[BatchIndex]);
+#endif  // VISUALIZE_RENDER_MESH
+
+	// Translatedに変換
+	Position = Position + DFHackToFloat(ResolvedView.PreViewTranslation);
+
+	float4 ClipPos = mul(float4(Position, 1.0), ResolvedView.TranslatedWorldToClip);
+
+	OutPosition = ClipPos;
+}
+
+#endif  // REIN_CLOTH_VISUALIZE_VS
+
+#if REIN_CLOTH_VISUALIZE_PS
+
+void MainPS (
+	in float4 Position : SV_POSITION
+	, out float4 OutColor : SV_Target0
+)
+{
+	OutColor = float4(Color, 1.0);
+}
+
+#endif  // REIN_CLOTH_VISUALIZE_PS
