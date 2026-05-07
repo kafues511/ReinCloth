@@ -147,7 +147,7 @@ public:
 	/**
 	 * @brief 有効性
 	 */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Instance")
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Instance", Transient)
 	bool bIsValid = false;
 
 	/**
