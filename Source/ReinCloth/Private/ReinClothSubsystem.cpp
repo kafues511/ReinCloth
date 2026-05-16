@@ -26,14 +26,11 @@ void UReinClothSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void UReinClothSubsystem::Deinitialize()
 {
-	ENQUEUE_RENDER_COMMAND(ReinClothSubsystem_Deinitialize)([this](FRHICommandListImmediate& RHICmdList)
-	{
-		ViewExtension->Invalidate();
-		ViewExtension.Reset();
-		ViewExtension = nullptr;
-	});
+	ClothSettings.Reset();
+	VacantSections.Reset();
+	SharedBoneCacheMap.Reset();
 
-	FlushRenderingCommands();
+	ViewExtension->Invalidate();
 
 	Super::Deinitialize();
 }

@@ -926,6 +926,7 @@ void FReinClothViewExtension::Invalidate_RenderThread()
 		Section.Embeddeds.SafeRelease();
 		Section.EmbeddedInfluences.SafeRelease();
 
+		Section.Settings = {};
 		Section.bIsSetup = false;
 	}
 
@@ -933,5 +934,5 @@ void FReinClothViewExtension::Invalidate_RenderThread()
 	{
 		BoneResource.SafeRelease();
 	}
-	SharedBoneResources.Empty();
+	SharedBoneResources.Reset();
 }
