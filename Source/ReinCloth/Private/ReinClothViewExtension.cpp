@@ -560,7 +560,6 @@ void FReinClothViewExtension::Simulation_RenderThread(FRDGBuilder& GraphBuilder,
 	}
 
 	RDG_EVENT_SCOPE_STAT(GraphBuilder, ReinCloth, "ReinCloth");
-	RDG_GPU_STAT_SCOPE(GraphBuilder, ReinCloth);
 
 	auto GlobalShaderMap = GetGlobalShaderMap(InViewFamily.GetFeatureLevel());
 
@@ -621,7 +620,6 @@ void FReinClothViewExtension::Simulation_RenderThread(FRDGBuilder& GraphBuilder,
 	#pragma region ReinClothSolveIntegrated
 	{
 		RDG_EVENT_SCOPE_STAT(GraphBuilder, ReinClothSolveIntegrated, "ReinCloth.SolveIntegrated");
-		RDG_GPU_STAT_SCOPE(GraphBuilder, ReinClothSolveIntegrated);
 
 		FReinClothSolveIntegratedCS::FPermutationDomain PermutationVector;
 		PermutationVector.Set<FReinClothSolveIntegratedCS::FResetSimulation>(bIsResetSimulation);
@@ -715,7 +713,6 @@ FScreenPassTexture FReinClothViewExtension::PostProcessPass_RenderThread(FRDGBui
 	}
 
 	RDG_EVENT_SCOPE_STAT(GraphBuilder, ReinClothVisualize, "ReinClothVisualize");
-	RDG_GPU_STAT_SCOPE(GraphBuilder, ReinClothVisualize);
 
 	const FScreenPassTextureViewport InputViewport(SceneColor);
 	const FScreenPassTextureViewport OutputViewport(InputViewport);
