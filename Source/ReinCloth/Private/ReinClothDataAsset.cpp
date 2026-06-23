@@ -9,6 +9,7 @@
 #include "Rendering/SkeletalMeshRenderData.h"
 
 #include "Algo/IndexOf.h"
+#include "Algo/AllOf.h"
 
 #include "StaticMeshAttributes.h"
 
@@ -344,7 +345,7 @@ namespace ReinClothLib
 };
 #endif  // WITH_EDITOR
 
-EReinClothSetupFlags FReinClothSimMeshSection::Setup(const USkeletalMesh* SkeletalRenderMeshAsset, const USkeletalMesh* SkeletalSimulationMeshAsset, int32 ClothUVChannel, float GridSize, bool bIsForce, FString& OutMessage)
+EReinClothSetupFlags FReinClothSimMeshSection::Setup(const USkeletalMesh* SkeletalRenderMeshAsset, const USkeletalMesh* SkeletalSimulationMeshAsset, int32 ClothUVChannel, float InGridSize, bool bIsForce, FString& OutMessage)
 {
 #if WITH_EDITOR
 	const auto SkeletalRenderMeshModel = SkeletalRenderMeshAsset->GetImportedModel();
@@ -371,7 +372,7 @@ EReinClothSetupFlags FReinClothSimMeshSection::Setup(const USkeletalMesh* Skelet
 	SHA.Update(reinterpret_cast<const uint8*>(&SkeletalRenderMeshModel->SkeletalMeshModelGUID), sizeof(FGuid));
 	SHA.Update(reinterpret_cast<const uint8*>(&SkeletalSimulationMeshModel->SkeletalMeshModelGUID), sizeof(FGuid));
 	SHA.Update(reinterpret_cast<const uint8*>(&ClothUVChannel), sizeof(int32));
-	SHA.Update(reinterpret_cast<const uint8*>(&GridSize), sizeof(float));
+	SHA.Update(reinterpret_cast<const uint8*>(&InGridSize), sizeof(float));
 	SHA.Update(reinterpret_cast<const uint8*>(&RenderSection), sizeof(int32));
 	SHA.Update(reinterpret_cast<const uint8*>(&TargetInfluence), sizeof(EReinClothTargetInfluence));
 	SHA.Update(reinterpret_cast<const uint8*>(&EmbeddedOffsetMode), sizeof(EReinClothEmbeddedOffsetMode));
@@ -412,7 +413,7 @@ EReinClothSetupFlags FReinClothSimMeshSection::Setup(const USkeletalMesh* Skelet
 			SkeletalSimulationMeshAsset,
 			Piece.SimulationSection,
 			ConstraintUVChannel,
-			GridSize,
+			InGridSize,
 			Piece.BaseVertex,
 			Piece.Vertices,
 			Piece.Indices,
@@ -430,7 +431,7 @@ EReinClothSetupFlags FReinClothSimMeshSection::Setup(const USkeletalMesh* Skelet
 		SkeletalRenderMeshAsset,
 		RenderSection,
 		ClothUVChannel,
-		GridSize,
+		InGridSize,
 		BaseVertex,
 		RenderMesh_Vertices,
 		RenderMesh_Indices,
@@ -529,26 +530,13 @@ EReinClothSetupFlags UReinClothDataAsset::SetupClothUV(bool bIsForce, FString& O
 
 	const auto& Materials = SkeletalRenderMeshAsset->GetMaterials();
 
-	TSet<FName> SlotNames;
-	for (const auto& Section : Sections)
-	{
-		for (int32 MaterialIndex = 0; MaterialIndex < Materials.Num(); ++MaterialIndex)
-		{
-			if (Materials[MaterialIndex].MaterialSlotName == Section.RenderSlotName)
-			{
-				SlotNames.Add(Materials[MaterialIndex].ImportedMaterialSlotName);
-				break;
-			}
-		}
-	}
-
 	FSHA1 SHA;
 	SHA.Update(reinterpret_cast<const uint8*>(&SkeletalMeshModel->SkeletalMeshModelGUID), sizeof(FGuid));
 	SHA.Update(reinterpret_cast<const uint8*>(&ClothUVChannel), sizeof(int32));
-	for (const auto& SlotName : SlotNames)
+	for (const auto& Section : Sections)
 	{
 		// FNameはエンジン起動毎に内部テーブルが異なるためハッシュが一致しない
-		auto NameStr = SlotName.ToString();
+		auto NameStr = Section.RenderSlotName.ToString();
 		auto NameBytes = NameStr.Len() * sizeof(TCHAR);
 		SHA.Update(reinterpret_cast<const uint8*>(*NameStr), NameBytes);
 	}
@@ -556,8 +544,9 @@ EReinClothSetupFlags UReinClothDataAsset::SetupClothUV(bool bIsForce, FString& O
 
 	FSHAHash SHAHash;
 	SHA.GetHash(&SHAHash.Hash[0]);
-	FString NewGuid = SHAHash.ToString();
-	if (Guid == NewGuid && !bIsForce)
+	auto NewGuid = SHAHash.ToString();
+	auto bHasSectionGridSize = Algo::AllOf(Sections, [](const auto& Section) { return Section.GridSize > 0; });
+	if (Guid == NewGuid && bHasSectionGridSize && !bIsForce)
 	{
 		return EReinClothSetupFlags::Already;
 	}
@@ -582,58 +571,77 @@ EReinClothSetupFlags UReinClothDataAsset::SetupClothUV(bool bIsForce, FString& O
 		VertexInstanceUVs.SetNumChannels(ClothUVChannel + 1);
 	}
 
-	TSet<FPolygonGroupID> PolygonGroups;
-	for (FPolygonGroupID PolygonGroupID : MeshDescription->PolygonGroups().GetElementIDs())
+	for (auto& Section : Sections)
 	{
-		if (SlotNames.Contains(PolygonGroupMaterialSlotNames[PolygonGroupID]))
+		FName ImportedMaterialSlotName = NAME_None;
+		for (int32 MaterialIndex = 0; MaterialIndex < Materials.Num(); ++MaterialIndex)
 		{
-			PolygonGroups.Add(PolygonGroupID);
-		}
-	}
-
-	TSet<FVertexID> VertexIDSet;
-	for (FPolygonGroupID PolygonGroupID : PolygonGroups)
-	{
-		for (FPolygonID PolygonID : MeshDescription->GetPolygonGroupPolygonIDs(PolygonGroupID))
-		{
-			for (FVertexID VertexID : MeshDescription->GetPolygonVertices(PolygonID))
+			if (Materials[MaterialIndex].MaterialSlotName == Section.RenderSlotName)
 			{
-				VertexIDSet.Add(VertexID);
+				ImportedMaterialSlotName = Materials[MaterialIndex].ImportedMaterialSlotName;
+				break;
 			}
 		}
-	}
 
-	auto VertexIds = VertexIDSet.Array();
-	auto NumVertices = VertexIds.Num();
-	if (NumVertices <= 0)
-	{
-		OutMessage = TEXT("不正な頂点数");
-		return EReinClothSetupFlags::Failed;
-	}
-
-	GridSize = FMath::CeilToInt(FMath::Sqrt(static_cast<float>(NumVertices)));
-	GridSize = FMath::RoundUpToPowerOfTwo(GridSize);
-
-	for (FPolygonGroupID PolygonGroupID : MeshDescription->PolygonGroups().GetElementIDs())
-	{
-		for (FPolygonID PolygonID : MeshDescription->GetPolygonGroupPolygonIDs(PolygonGroupID))
+		if (ImportedMaterialSlotName.IsNone())
 		{
-			for (FVertexInstanceID VertexInstanceID : MeshDescription->GetPolygonVertexInstances(PolygonID))
+			OutMessage = FString::Format(TEXT("Render Slot Name {0} に対応するMaterialSlotが見つかりません。"), { Section.RenderSlotName.ToString() });
+			return EReinClothSetupFlags::Failed;
+		}
+
+		TSet<FPolygonGroupID> PolygonGroups;
+		for (FPolygonGroupID PolygonGroupID : MeshDescription->PolygonGroups().GetElementIDs())
+		{
+			if (PolygonGroupMaterialSlotNames[PolygonGroupID] == ImportedMaterialSlotName)
 			{
-				auto VertexID = MeshDescription->GetVertexInstanceVertex(VertexInstanceID);
-				auto FlattenUV = VertexIds.Find(VertexID);
-				if (FlattenUV == INDEX_NONE)
+				PolygonGroups.Add(PolygonGroupID);
+			}
+		}
+
+		TSet<FVertexID> VertexIDSet;
+		for (FPolygonGroupID PolygonGroupID : PolygonGroups)
+		{
+			for (FPolygonID PolygonID : MeshDescription->GetPolygonGroupPolygonIDs(PolygonGroupID))
+			{
+				for (FVertexID VertexID : MeshDescription->GetPolygonVertices(PolygonID))
 				{
-					FlattenUV = GridSize - 1;
+					VertexIDSet.Add(VertexID);
 				}
+			}
+		}
 
-				auto X = FlattenUV % GridSize;
-				auto Y = FlattenUV / GridSize;
+		auto VertexIds = VertexIDSet.Array();
+		auto NumVertices = VertexIds.Num();
+		if (NumVertices <= 0)
+		{
+			OutMessage = FString::Format(TEXT("Section {0}: 不正な頂点数"), { Section.UniqueName.ToString() });
+			return EReinClothSetupFlags::Failed;
+		}
 
-				auto U = static_cast<float>(X) / static_cast<float>(GridSize);
-				auto V = static_cast<float>(Y) / static_cast<float>(GridSize);
+		Section.GridSize = FMath::CeilToInt(FMath::Sqrt(static_cast<float>(NumVertices)));
+		Section.GridSize = FMath::RoundUpToPowerOfTwo(Section.GridSize);
 
-				VertexInstanceUVs.Set(VertexInstanceID, ClothUVChannel, FVector2f(U, V));
+		for (FPolygonGroupID PolygonGroupID : PolygonGroups)
+		{
+			for (FPolygonID PolygonID : MeshDescription->GetPolygonGroupPolygonIDs(PolygonGroupID))
+			{
+				for (FVertexInstanceID VertexInstanceID : MeshDescription->GetPolygonVertexInstances(PolygonID))
+				{
+					auto VertexID = MeshDescription->GetVertexInstanceVertex(VertexInstanceID);
+					auto FlattenUV = VertexIds.Find(VertexID);
+					if (FlattenUV == INDEX_NONE)
+					{
+						continue;
+					}
+
+					auto X = FlattenUV % Section.GridSize;
+					auto Y = FlattenUV / Section.GridSize;
+
+					auto U = static_cast<float>(X) / static_cast<float>(Section.GridSize);
+					auto V = static_cast<float>(Y) / static_cast<float>(Section.GridSize);
+
+					VertexInstanceUVs.Set(VertexInstanceID, ClothUVChannel, FVector2f(U, V));
+				}
 			}
 		}
 	}
@@ -741,7 +749,7 @@ void UReinClothDataAsset::Setup_Impl(bool bIsForce)
 
 	for (auto& Section : Sections)
 	{
-		SetupFlags |= Section.Setup(SkeletalRenderMeshAsset, SkeletalSimulationMeshAsset, ClothUVChannel, static_cast<float>(GridSize), bIsForce, Message);
+		SetupFlags |= Section.Setup(SkeletalRenderMeshAsset, SkeletalSimulationMeshAsset, ClothUVChannel, static_cast<float>(Section.GridSize), bIsForce, Message);
 		if (EnumHasAnyFlags(SetupFlags, EReinClothSetupFlags::Failed))
 		{
 			Message = FString::Format(TEXT("Section {0}: {1}"), { Section.UniqueName.ToString(), Message });

@@ -62,6 +62,7 @@ struct FReinClothSimulationSection
 
 	TRefCountPtr<FRDGPooledBuffer> Positions;
 	TRefCountPtr<FRDGPooledBuffer> Velocities;
+	TRefCountPtr<FRDGPooledBuffer> PrevAnimOrigins;
 
 	FReinClothBuffer<uint32> Offsets;
 	FReinClothBuffer<uint32> Neighbors;
@@ -70,13 +71,13 @@ struct FReinClothSimulationSection
 	FReinClothBuffer<FVector4f> Origins;
 	FReinClothBuffer<FReinClothInfluence> Influences;
 
-	FReinClothBuffer<FReinClothCollision> Collisions;
-
 	FReinClothBuffer<uint32> NormalOffsets;
 	FReinClothBuffer<uint32> NormalNeighbors;
 
 	FReinClothBuffer<FReinClothEmbedded> Embeddeds;
 	FReinClothBuffer<FReinClothInfluence> EmbeddedInfluences;
+
+	FVector3f PreviousSimulationOrigin = FVector3f::ZeroVector;
 
 	bool bIsSetup = false;
 };
@@ -95,7 +96,7 @@ public:
 public:
 	void Invalidate();
 	void Invalidate_RenderThread();
-	void Simulation_RenderThread(FRDGBuilder& GraphBuilder, FSceneViewFamily& InViewFamily, int32 SectionIndex);
+	void Simulation_RenderThread(FRDGBuilder& GraphBuilder, FSceneViewFamily& InViewFamily, int32 SectionIndex, const TMap<TWeakObjectPtr<USkeletalMeshComponent>, FRDGBufferSRVRef>& BoneMatrixSRVs);
 	FScreenPassTexture PostProcessPass_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FPostProcessMaterialInputs& Inputs);
 
 private:
@@ -114,27 +115,11 @@ public:
 
 	struct FReinClothBoneResource
 	{
-		FReinClothBuffer<FReinClothMatrix3x4> Resource;
 		TArray<FReinClothMatrix3x4> Data;
-
-		FBufferRHIRef GetBuffer() const
-		{
-			return Resource.Buffer;
-		}
-
-		FShaderResourceViewRHIRef GetSRV() const
-		{
-			return Resource.SRV;
-		}
 
 		SIZE_T GetResourceSize() const
 		{
-			return Resource.GetResourceSize();
-		}
-
-		void SafeRelease()
-		{
-			Resource.SafeRelease();
+			return sizeof(*this) + Data.GetAllocatedSize();
 		}
 	};
 

@@ -85,6 +85,13 @@ public:
 	float VelocityDamping = 0.99f;
 
 	/**
+	 * @brief アニメーション変位の反映率
+	 * 値が大きいほどアニメ由来の急な引っ張りが抑えられます。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Instance", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float AnimDeltaScale = 0.0f;
+
+	/**
 	 * @brief サブステップあたりに許容する変位量
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Instance", meta = (ClampMin = "0.0", ClampMax = "100.0"))

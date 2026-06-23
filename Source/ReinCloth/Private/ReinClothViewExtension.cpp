@@ -12,8 +12,6 @@ DECLARE_GPU_STAT(ReinCloth);
 DECLARE_GPU_STAT_NAMED(ReinClothVisualize, TEXT("ReinCloth.Visualize"));
 DECLARE_GPU_STAT_NAMED(ReinClothSolveIntegrated, TEXT("ReinCloth.SolveIntegrated"));
 
-DECLARE_CYCLE_STAT(TEXT("Vertex Buffer RHI Lock and Copy"), STAT_ReinCloth_VertexBufferRHI_LockAndCopy, STATGROUP_ReinCloth);
-
 DECLARE_MEMORY_STAT(TEXT("Total Memory"), STAT_ReinCloth_TotalMemory, STATGROUP_ReinCloth);
 
 DECLARE_DWORD_COUNTER_STAT(TEXT("Num Instances"), STAT_ReinCloth_NumInstances, STATGROUP_ReinCloth);
@@ -49,6 +47,7 @@ public:
 		SHADER_PARAMETER(uint32, NumCollisions)
 
 		SHADER_PARAMETER(float, VelocityDamping)
+		SHADER_PARAMETER(float, AnimDeltaScale)
 		SHADER_PARAMETER(FVector3f, Gravity)
 
 		SHADER_PARAMETER(float, StructuralVerticalCompliance)
@@ -60,9 +59,12 @@ public:
 		SHADER_PARAMETER(float, MaxDisplacement)
 
 		SHADER_PARAMETER(FMatrix44f, RenderMatrix)
+		SHADER_PARAMETER(FVector3f, SimulationOrigin)
+		SHADER_PARAMETER(FVector3f, SimulationOriginDelta)
 
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, PositionUAV)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, VelocityUAV)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, PrevAnimOriginUAV)
 
 		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, OffsetSRV)
 		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, NeighborSRV)
@@ -70,9 +72,9 @@ public:
 
 		SHADER_PARAMETER_SRV(StructuredBuffer<float4>, OriginSRV)
 		SHADER_PARAMETER_SRV(StructuredBuffer<FReinClothInfluence>, InfluenceSRV)
-		SHADER_PARAMETER_SRV(StructuredBuffer<FReinClothMatrix3x4>, BoneMatrixSRV)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FReinClothMatrix3x4>, BoneMatrixSRV)
 
-		SHADER_PARAMETER_SRV(StructuredBuffer<FReinClothCollision>, CollisionSRV)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FReinClothCollision>, CollisionSRV)
 
 		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, NormalOffsetSRV)
 		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, NormalNeighborSRV)
@@ -108,10 +110,11 @@ public:
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
 		SHADER_PARAMETER(FMatrix44f, RenderMatrix)
+		SHADER_PARAMETER(FVector3f, SimulationOrigin)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PositionSRV)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint4>, TriangleSRV)
 		SHADER_PARAMETER_SRV(StructuredBuffer<FReinClothInfluence>, InfluenceSRV)
-		SHADER_PARAMETER_SRV(StructuredBuffer<FReinClothMatrix3x4>, BoneMatrixSRV)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FReinClothMatrix3x4>, BoneMatrixSRV)
 		SHADER_PARAMETER_SRV(StructuredBuffer<FReinClothEmbedded>, EmbeddedSRV)
 		SHADER_PARAMETER_SRV(StructuredBuffer<FReinClothInfluence>, EmbeddedInfluenceSRV)
 	END_SHADER_PARAMETER_STRUCT()
@@ -225,7 +228,7 @@ void FReinClothViewExtension::SetupViewFamily(FSceneViewFamily& InViewFamily)
 		REIN_COPY_TO(NumSubsteps);
 
 		REIN_COPY_TO(VelocityDamping);
-
+		REIN_COPY_TO(AnimDeltaScale);
 		REIN_COPY_TO(Gravity);
 
 		REIN_COPY_TO(MaxDisplacement);
@@ -253,10 +256,12 @@ void FReinClothViewExtension::SetupViewFamily(FSceneViewFamily& InViewFamily)
 		if (const auto SkeletalMeshComponent = Src.WeakSkeletalMeshComponent.Get(); IsValid(SkeletalMeshComponent))
 		{
 			Dst.RenderMatrix = FMatrix44f(SkeletalMeshComponent->GetRenderMatrix().GetTransposed());
+			Dst.SimulationOrigin = FVector3f(SkeletalMeshComponent->GetActorPositionForRenderer());
 		}
 		else
 		{
 			Dst.RenderMatrix = FMatrix44f::Identity;
+			Dst.SimulationOrigin = FVector3f::ZeroVector;
 		}
 
 		#undef REIN_COPY_TO
@@ -326,7 +331,8 @@ void FReinClothViewExtension::PreRenderViewFamily_RenderThread(FRDGBuilder& Grap
 		return;
 	}
 
-	for (auto& [_, SharedBoneResource] : SharedBoneResources)
+	TMap<TWeakObjectPtr<USkeletalMeshComponent>, FRDGBufferSRVRef> BoneMatrixSRVs;
+	for (auto& [WeakSkeletalMeshComponent, SharedBoneResource] : SharedBoneResources)
 	{
 		auto NumBoneMatrices = SharedBoneResource.Data.Num();
 		if (NumBoneMatrices <= 0)
@@ -334,33 +340,15 @@ void FReinClothViewExtension::PreRenderViewFamily_RenderThread(FRDGBuilder& Grap
 			continue;
 		}
 
-		if (SharedBoneResource.Resource.NumData != NumBoneMatrices)
-		{
-			// note: 意図的にSafeRelease呼んでないだけ
-			SharedBoneResource.Resource.Data.SetNumUninitialized(NumBoneMatrices);
-			FMemory::Memcpy(SharedBoneResource.Resource.Data.GetData(), SharedBoneResource.Data.GetData(), sizeof(FReinClothMatrix3x4) * NumBoneMatrices);
-
-			auto Usage = (EBufferUsageFlags::Static | EBufferUsageFlags::StructuredBuffer);
-			auto Access = ERHIAccess::SRVCompute;
-			auto CreateDesc = SharedBoneResource.Resource.CreateDesc(TEXT("ReinCloth.BoneMatrices"), Usage, Access);
-
-			SharedBoneResource.Resource.Buffer = GraphBuilder.RHICmdList.CreateBuffer(CreateDesc);
-			SharedBoneResource.Resource.SRV = GraphBuilder.RHICmdList.CreateShaderResourceView(SharedBoneResource.Resource.Buffer, FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(SharedBoneResource.Resource.Buffer));
-		}
-		else
-		{
-			SCOPE_CYCLE_COUNTER(STAT_ReinCloth_VertexBufferRHI_LockAndCopy);
-
-			uint32 Size = sizeof(FReinClothMatrix3x4) * NumBoneMatrices;
-			auto BoneBuffer = (FReinClothMatrix3x4*)GraphBuilder.RHICmdList.LockBuffer(SharedBoneResource.Resource.Buffer, 0, Size, RLM_WriteOnly);
-			FPlatformMemory::Memcpy(BoneBuffer, SharedBoneResource.Data.GetData(), Size);
-			GraphBuilder.RHICmdList.UnlockBuffer(SharedBoneResource.Resource.Buffer);
-		}
+		auto BoneMatrixDesc = FRDGBufferDesc::CreateStructuredDesc(sizeof(FReinClothMatrix3x4), NumBoneMatrices);
+		auto BoneMatrixBuffer = GraphBuilder.CreateBuffer(BoneMatrixDesc, TEXT("ReinCloth.BoneMatrices"));
+		GraphBuilder.QueueBufferUpload(BoneMatrixBuffer, SharedBoneResource.Data.GetData(), sizeof(FReinClothMatrix3x4) * NumBoneMatrices);
+		BoneMatrixSRVs.Add(WeakSkeletalMeshComponent, GraphBuilder.CreateSRV(BoneMatrixBuffer));
 	}
 
 	for (int32 Index = 0; Index < Sections.Num(); ++Index)
 	{
-		Simulation_RenderThread(GraphBuilder, InViewFamily, Index);
+		Simulation_RenderThread(GraphBuilder, InViewFamily, Index, BoneMatrixSRVs);
 	}
 }
 
@@ -402,6 +390,7 @@ void FReinClothViewExtension::ApplySnapshot_RenderThread(FSnapshotCache&& Snapsh
 	#if WITH_EDITOR
 		TotalMemoryUsage += Dst.Positions ? Dst.Positions->GetSize() : 0u;
 		TotalMemoryUsage += Dst.Velocities ? Dst.Velocities->GetSize() : 0u;
+		TotalMemoryUsage += Dst.PrevAnimOrigins ? Dst.PrevAnimOrigins->GetSize() : 0u;
 
 		TotalMemoryUsage += Dst.Offsets.GetResourceSize();
 		TotalMemoryUsage += Dst.Neighbors.GetResourceSize();
@@ -409,8 +398,6 @@ void FReinClothViewExtension::ApplySnapshot_RenderThread(FSnapshotCache&& Snapsh
 
 		TotalMemoryUsage += Dst.Origins.GetResourceSize();
 		TotalMemoryUsage += Dst.Influences.GetResourceSize();
-
-		TotalMemoryUsage += Dst.Collisions.GetResourceSize();
 
 		TotalMemoryUsage += Dst.NormalOffsets.GetResourceSize();
 		TotalMemoryUsage += Dst.NormalNeighbors.GetResourceSize();
@@ -424,7 +411,6 @@ void FReinClothViewExtension::ApplySnapshot_RenderThread(FSnapshotCache&& Snapsh
 	{
 		if (!It.Key().IsValid())
 		{
-			It.Value().SafeRelease();
 			It.RemoveCurrent();
 		}
 	}
@@ -469,7 +455,7 @@ void FReinClothViewExtension::SubscribeToPostProcessingPass(EPostProcessingPass 
 #endif  // WITH_EDITOR
 }
 
-void FReinClothViewExtension::Simulation_RenderThread(FRDGBuilder& GraphBuilder, FSceneViewFamily& InViewFamily, int32 SectionIndex)
+void FReinClothViewExtension::Simulation_RenderThread(FRDGBuilder& GraphBuilder, FSceneViewFamily& InViewFamily, int32 SectionIndex, const TMap<TWeakObjectPtr<USkeletalMeshComponent>, FRDGBufferSRVRef>& BoneMatrixSRVs)
 {
 	auto& RHICmdList = GraphBuilder.RHICmdList;
 	auto& ClothSection = Sections[SectionIndex];
@@ -491,13 +477,8 @@ void FReinClothViewExtension::Simulation_RenderThread(FRDGBuilder& GraphBuilder,
 		return;
 	}
 
-	auto BoneResource = SharedBoneResources.Find(ClothSettings.WeakSkeletalMeshComponent);
-	if (BoneResource == nullptr)
-	{
-		return;
-	}
-
-	if (BoneResource->Resource.NumData <= 0)
+	auto BoneMatrixSRV = BoneMatrixSRVs.FindRef(ClothSettings.WeakSkeletalMeshComponent);
+	if (BoneMatrixSRV == nullptr)
 	{
 		return;
 	}
@@ -505,6 +486,8 @@ void FReinClothViewExtension::Simulation_RenderThread(FRDGBuilder& GraphBuilder,
 	const auto& ClothAssetSection = ClothAsset->Sections[ClothSettings.SectionIndex];
 
 	auto bIsResetSimulation = ClothSettings.bIsResetSimulation;
+	auto SimulationOrigin = ClothSettings.SimulationOrigin;
+	auto SimulationOriginDelta = ClothSection.bIsSetup ? (ClothSection.PreviousSimulationOrigin - SimulationOrigin) : FVector3f::ZeroVector;
 
 	if (!ClothSection.bIsSetup)
 	{
@@ -519,6 +502,11 @@ void FReinClothViewExtension::Simulation_RenderThread(FRDGBuilder& GraphBuilder,
 		auto VelocityBuffer = GraphBuilder.CreateBuffer(VelocityDesc, TEXT("ReinCloth.Velocities"));
 		GraphBuilder.QueueBufferUpload(VelocityBuffer, ClothAssetSection.Velocities.GetData(), sizeof(FVector4f) * NumVelocities);
 		ClothSection.Velocities = GraphBuilder.ConvertToExternalBuffer(VelocityBuffer);
+
+		auto PrevAnimOriginDesc = FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector4f), NumPositions);
+		auto PrevAnimOriginBuffer = GraphBuilder.CreateBuffer(PrevAnimOriginDesc, TEXT("ReinCloth.PrevAnimOrigins"));
+		GraphBuilder.QueueBufferUpload(PrevAnimOriginBuffer, ClothAssetSection.Positions.GetData(), sizeof(FVector4f) * NumPositions);
+		ClothSection.PrevAnimOrigins = GraphBuilder.ConvertToExternalBuffer(PrevAnimOriginBuffer);
 
 		#define REIN_COPY_TO(Name, BytesPerElement) \
 			if (ClothAssetSection.Name.Num() > 0) \
@@ -542,7 +530,6 @@ void FReinClothViewExtension::Simulation_RenderThread(FRDGBuilder& GraphBuilder,
 		REIN_COPY_TO(Constraints, sizeof(FReinClothConstraint));
 		REIN_COPY_TO(Origins, sizeof(FVector4f));
 		REIN_COPY_TO(Influences, sizeof(FReinClothInfluence));
-		ClothSection.Collisions.Data.SetNumZeroed(ClothSettings.Collisions.Num());
 		REIN_COPY_TO(NormalOffsets, sizeof(uint32));
 		REIN_COPY_TO(NormalNeighbors, sizeof(uint32));
 		REIN_COPY_TO(Embeddeds, sizeof(FReinClothEmbedded));
@@ -553,7 +540,6 @@ void FReinClothViewExtension::Simulation_RenderThread(FRDGBuilder& GraphBuilder,
 		REIN_CREATE_SRV_BUFFER(Constraints);
 		REIN_CREATE_SRV_BUFFER(Origins);
 		REIN_CREATE_SRV_BUFFER(Influences);
-		REIN_CREATE_SRV_BUFFER(Collisions);
 		REIN_CREATE_SRV_BUFFER(NormalOffsets);
 		REIN_CREATE_SRV_BUFFER(NormalNeighbors);
 		REIN_CREATE_SRV_BUFFER(Embeddeds);
@@ -611,11 +597,14 @@ void FReinClothViewExtension::Simulation_RenderThread(FRDGBuilder& GraphBuilder,
 	auto VelocityBuffer = GraphBuilder.RegisterExternalBuffer(ClothSection.Velocities);
 	auto VelocityUAV = GraphBuilder.CreateUAV(VelocityBuffer);
 
+	auto PrevAnimOriginBuffer = GraphBuilder.RegisterExternalBuffer(ClothSection.PrevAnimOrigins);
+	auto PrevAnimOriginUAV = GraphBuilder.CreateUAV(PrevAnimOriginBuffer);
+
 	auto PositionTextureBuffer = GraphBuilder.RegisterExternalTexture(CreateRenderTarget(ClothSettings.PositionResource->GetTexture2DRHI(), TEXT("ReinCloth.PositionTexture")));
-	auto PositionTextureUAV = GraphBuilder.CreateUAV(PositionTextureBuffer, ERDGUnorderedAccessViewFlags::None, PF_A32B32G32R32F);
+	auto PositionTextureUAV = GraphBuilder.CreateUAV(PositionTextureBuffer, ERDGUnorderedAccessViewFlags::None, PF_FloatRGBA);
 
 	auto NormalTextureBuffer = GraphBuilder.RegisterExternalTexture(CreateRenderTarget(ClothSettings.NormalResource->GetTexture2DRHI(), TEXT("ReinCloth.NormalTexture")));
-	auto NormalTextureUAV = GraphBuilder.CreateUAV(NormalTextureBuffer, ERDGUnorderedAccessViewFlags::None, PF_A32B32G32R32F);
+	auto NormalTextureUAV = GraphBuilder.CreateUAV(NormalTextureBuffer, ERDGUnorderedAccessViewFlags::None, PF_FloatRGBA);
 
 #if 0
 	auto PassFlags = (GSupportsEfficientAsyncCompute ? ERDGPassFlags::AsyncCompute : ERDGPassFlags::Compute);
@@ -623,15 +612,11 @@ void FReinClothViewExtension::Simulation_RenderThread(FRDGBuilder& GraphBuilder,
 	auto PassFlags = ERDGPassFlags::Compute;
 #endif
 
-	if (!bIsDisableCollision && ClothSettings.NumCollisions > 0)
-	{
-		SCOPE_CYCLE_COUNTER(STAT_ReinCloth_VertexBufferRHI_LockAndCopy);
-
-		uint32 Size = sizeof(FReinClothCollision) * FMath::Min(ClothSettings.NumCollisions, 512u);
-		auto Buffer = (FReinClothCollision*)GraphBuilder.RHICmdList.LockBuffer(ClothSection.Collisions.Buffer, 0, Size, RLM_WriteOnly);
-		FPlatformMemory::Memcpy(Buffer, ClothSettings.Collisions.GetData(), Size);
-		GraphBuilder.RHICmdList.UnlockBuffer(ClothSection.Collisions.Buffer);
-	}
+	auto CollisionUploadNum = FMath::Max(1u, FMath::Min(ClothSettings.NumCollisions, 512u));
+	auto CollisionDesc = FRDGBufferDesc::CreateStructuredDesc(sizeof(FReinClothCollision), CollisionUploadNum);
+	auto CollisionBuffer = GraphBuilder.CreateBuffer(CollisionDesc, TEXT("ReinCloth.Collision"));
+	GraphBuilder.QueueBufferUpload(CollisionBuffer, ClothSettings.Collisions.GetData(), sizeof(FReinClothCollision) * CollisionUploadNum);
+	auto CollisionSRV = GraphBuilder.CreateSRV(CollisionBuffer);
 
 	#pragma region ReinClothSolveIntegrated
 	{
@@ -661,6 +646,7 @@ void FReinClothViewExtension::Simulation_RenderThread(FRDGBuilder& GraphBuilder,
 		PassParameters->NumCollisions = ClothSettings.NumCollisions;
 
 		PassParameters->VelocityDamping = ClothSettings.VelocityDamping;
+		PassParameters->AnimDeltaScale = ClothSettings.AnimDeltaScale;
 		PassParameters->Gravity = ClothSettings.Gravity;
 
 		PassParameters->StructuralVerticalCompliance = ClothSettings.StructuralVerticalCompliance;
@@ -672,9 +658,12 @@ void FReinClothViewExtension::Simulation_RenderThread(FRDGBuilder& GraphBuilder,
 		PassParameters->MaxDisplacement = ClothSettings.MaxDisplacement;
 
 		PassParameters->RenderMatrix = ClothSettings.RenderMatrix;
+		PassParameters->SimulationOrigin = SimulationOrigin;
+		PassParameters->SimulationOriginDelta = SimulationOriginDelta;
 
 		PassParameters->PositionUAV = PositionUAV;
 		PassParameters->VelocityUAV = VelocityUAV;
+		PassParameters->PrevAnimOriginUAV = PrevAnimOriginUAV;
 
 		PassParameters->OffsetSRV = ClothSection.Offsets.SRV;
 		PassParameters->NeighborSRV = ClothSection.Neighbors.SRV;
@@ -682,9 +671,9 @@ void FReinClothViewExtension::Simulation_RenderThread(FRDGBuilder& GraphBuilder,
 
 		PassParameters->OriginSRV = ClothSection.Origins.SRV;
 		PassParameters->InfluenceSRV = ClothSection.Influences.SRV;
-		PassParameters->BoneMatrixSRV = BoneResource->GetSRV();
+		PassParameters->BoneMatrixSRV = BoneMatrixSRV;
 
-		PassParameters->CollisionSRV = ClothSection.Collisions.SRV;
+		PassParameters->CollisionSRV = CollisionSRV;
 
 		PassParameters->NormalOffsetSRV = ClothSection.NormalOffsets.SRV;
 		PassParameters->NormalNeighborSRV = ClothSection.NormalNeighbors.SRV;
@@ -707,6 +696,8 @@ void FReinClothViewExtension::Simulation_RenderThread(FRDGBuilder& GraphBuilder,
 
 	ClothSection.Positions = GraphBuilder.ConvertToExternalBuffer(PositionBuffer);
 	ClothSection.Velocities = GraphBuilder.ConvertToExternalBuffer(VelocityBuffer);
+	ClothSection.PrevAnimOrigins = GraphBuilder.ConvertToExternalBuffer(PrevAnimOriginBuffer);
+	ClothSection.PreviousSimulationOrigin = SimulationOrigin;
 }
 
 FScreenPassTexture FReinClothViewExtension::PostProcessPass_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FPostProcessMaterialInputs& Inputs)
@@ -731,6 +722,21 @@ FScreenPassTexture FReinClothViewExtension::PostProcessPass_RenderThread(FRDGBui
 
 	FGlobalShaderMap* GlobalShaderMap = GetGlobalShaderMap(View.GetFeatureLevel());
 
+	TMap<TWeakObjectPtr<USkeletalMeshComponent>, FRDGBufferSRVRef> BoneMatrixSRVs;
+	for (auto& [WeakSkeletalMeshComponent, SharedBoneResource] : SharedBoneResources)
+	{
+		auto NumBoneMatrices = SharedBoneResource.Data.Num();
+		if (NumBoneMatrices <= 0)
+		{
+			continue;
+		}
+
+		auto BoneMatrixDesc = FRDGBufferDesc::CreateStructuredDesc(sizeof(FReinClothMatrix3x4), NumBoneMatrices);
+		auto BoneMatrixBuffer = GraphBuilder.CreateBuffer(BoneMatrixDesc, TEXT("ReinCloth.BoneMatrices"));
+		GraphBuilder.QueueBufferUpload(BoneMatrixBuffer, SharedBoneResource.Data.GetData(), sizeof(FReinClothMatrix3x4) * NumBoneMatrices);
+		BoneMatrixSRVs.Add(WeakSkeletalMeshComponent, GraphBuilder.CreateSRV(BoneMatrixBuffer));
+	}
+
 	for (int32 SectionIndex = 0; SectionIndex < Sections.Num(); ++SectionIndex)
 	{
 		auto& ClothSection = Sections[SectionIndex];
@@ -752,13 +758,8 @@ FScreenPassTexture FReinClothViewExtension::PostProcessPass_RenderThread(FRDGBui
 			continue;
 		}
 
-		auto BoneResource = SharedBoneResources.Find(ClothSettings.WeakSkeletalMeshComponent);
-		if (BoneResource == nullptr)
-		{
-			continue;
-		}
-
-		if (BoneResource->Resource.NumData <= 0)
+		auto BoneMatrixSRV = BoneMatrixSRVs.FindRef(ClothSettings.WeakSkeletalMeshComponent);
+		if (BoneMatrixSRV == nullptr)
 		{
 			continue;
 		}
@@ -785,6 +786,7 @@ FScreenPassTexture FReinClothViewExtension::PostProcessPass_RenderThread(FRDGBui
 
 			auto PassParameters = GraphBuilder.AllocParameters<FReinClothVisualizeParameters>();
 			PassParameters->VSParameters.View = View.ViewUniformBuffer;
+			PassParameters->VSParameters.SimulationOrigin = ClothSettings.SimulationOrigin;
 			PassParameters->VSParameters.PositionSRV = PositionSRV;
 			PassParameters->VSParameters.TriangleSRV = TriangleSRV;
 			PassParameters->VSParameters.EmbeddedSRV = ClothSection.Embeddeds.SRV;
@@ -839,10 +841,11 @@ FScreenPassTexture FReinClothViewExtension::PostProcessPass_RenderThread(FRDGBui
 			auto PassParameters = GraphBuilder.AllocParameters<FReinClothVisualizeParameters>();
 			PassParameters->VSParameters.View = View.ViewUniformBuffer;
 			PassParameters->VSParameters.RenderMatrix = ClothSettings.RenderMatrix;
+			PassParameters->VSParameters.SimulationOrigin = ClothSettings.SimulationOrigin;
 			PassParameters->VSParameters.PositionSRV = PositionSRV;
 			PassParameters->VSParameters.TriangleSRV = TriangleSRV;
 			PassParameters->VSParameters.InfluenceSRV = ClothSection.Influences.SRV;
-			PassParameters->VSParameters.BoneMatrixSRV = BoneResource->GetSRV();
+			PassParameters->VSParameters.BoneMatrixSRV = BoneMatrixSRV;
 			PassParameters->VSParameters.EmbeddedSRV = ClothSection.Embeddeds.SRV;
 			PassParameters->VSParameters.EmbeddedInfluenceSRV = ClothSection.EmbeddedInfluences.SRV;
 			PassParameters->PSParameters.Color = FVector3f(1.0f, 0.0f, 0.0f);
@@ -910,6 +913,7 @@ void FReinClothViewExtension::Invalidate_RenderThread()
 	{
 		Section.Positions.SafeRelease();
 		Section.Velocities.SafeRelease();
+		Section.PrevAnimOrigins.SafeRelease();
 
 		Section.Offsets.SafeRelease();
 		Section.Neighbors.SafeRelease();
@@ -917,8 +921,6 @@ void FReinClothViewExtension::Invalidate_RenderThread()
 
 		Section.Origins.SafeRelease();
 		Section.Influences.SafeRelease();
-
-		Section.Collisions.SafeRelease();
 
 		Section.NormalOffsets.SafeRelease();
 		Section.NormalNeighbors.SafeRelease();
@@ -930,9 +932,5 @@ void FReinClothViewExtension::Invalidate_RenderThread()
 		Section.bIsSetup = false;
 	}
 
-	for (auto& [WeakSkeletalMeshComponent, BoneResource] : SharedBoneResources)
-	{
-		BoneResource.SafeRelease();
-	}
 	SharedBoneResources.Reset();
 }

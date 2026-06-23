@@ -17,6 +17,7 @@ uint MaxEmbeddedsPerPosition;
 uint NumCollisions;
 
 float VelocityDamping;
+float AnimDeltaScale;
 float3 Gravity;
 
 float StructuralVerticalCompliance;
@@ -28,9 +29,12 @@ float BendingHorizontalCompliance;
 float MaxDisplacement;
 
 float4x4 RenderMatrix;
+float3 SimulationOrigin;
+float3 SimulationOriginDelta;
 
 RWStructuredBuffer<float4> PositionUAV;  // xyz: pos, w: inv mass
 RWStructuredBuffer<float4> VelocityUAV;  // xyz: vel, w: pad
+RWStructuredBuffer<float4> PrevAnimOriginUAV;  // xyz: prev anim origin, w: pad
 
 StructuredBuffer<uint> OffsetSRV;
 StructuredBuffer<uint> NeighborSRV;
@@ -87,6 +91,7 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupThreadIndex : SV_GroupIndex)
 	float4 Position = (float4)0;
 	float4 Predict = (float4)0;
 	float4 Velocity = (float4)0;
+	float4 PrevAnimOrigin = (float4)0;
 
 	uint Start = 0u;
 	uint End = 0u;
@@ -104,6 +109,7 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupThreadIndex : SV_GroupIndex)
 	{
 		Position = Predict = PositionUAV[BatchIndex];
 		Velocity = VelocityUAV[BatchIndex];
+		PrevAnimOrigin = PrevAnimOriginUAV[BatchIndex];
 
 		Start = OffsetSRV[BatchIndex];
 		End = OffsetSRV[BatchIndex + 1];
@@ -113,8 +119,19 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupThreadIndex : SV_GroupIndex)
 		Influence = InfluenceSRV[BatchIndex];
 		BoneMatrix = ComputeBoneMatrixWithLimitedInfluences(Influence);
 
+		GetPosition(Position) += SimulationOriginDelta;
+
 		GetOrigin(Origin) = mul(BoneMatrix,   float4(GetOrigin(Origin), 1.0)).xyz;
 		GetOrigin(Origin) = mul(RenderMatrix, float4(GetOrigin(Origin), 1.0)).xyz;
+		GetOrigin(Origin) -= SimulationOrigin;
+
+	#if RESET_SIMULATION == 1
+		GetPrevAnimPosition(PrevAnimOrigin) = GetOrigin(Origin);
+	#else  // RESET_SIMULATION
+
+		GetPosition(Position) += (GetOrigin(Origin) - GetPrevAnimPosition(PrevAnimOrigin)) * AnimDeltaScale;
+		GetPrevAnimPosition(PrevAnimOrigin) = GetOrigin(Origin);
+	#endif  // RESET_SIMULATION
 
 	#if RESET_SIMULATION == 0
 		if (GetInvMass(Predict) <= 0.0)
@@ -268,10 +285,12 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupThreadIndex : SV_GroupIndex)
 			{
 				FReinClothCollision Collision = CollisionSRV[Index];
 
-				float3 AB = Collision.CapsuleEnd - Collision.CapsuleStart;
-				float3 AP = GetPredict(Predict) - Collision.CapsuleStart;
+				float3 CapsuleStart = Collision.CapsuleStart - SimulationOrigin;
+				float3 CapsuleEnd = Collision.CapsuleEnd - SimulationOrigin;
+				float3 AB = CapsuleEnd - CapsuleStart;
+				float3 AP = GetPredict(Predict) - CapsuleStart;
 				float t = saturate(dot(AP, AB) / SizeSquared(AB));
-				float3 Q = Collision.CapsuleStart + t * AB;
+				float3 Q = CapsuleStart + t * AB;
 
 				float3 Diff = GetPredict(Predict) - Q;
 				float DistSq = SizeSquared(Diff);
@@ -310,10 +329,12 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupThreadIndex : SV_GroupIndex)
 			{
 				FReinClothCollision Collision = CollisionSRV[Index];
 
-				float3 AB = Collision.CapsuleEnd - Collision.CapsuleStart;
-				float3 AP = GetPredict(Predict) - Collision.CapsuleStart;
+				float3 CapsuleStart = Collision.CapsuleStart - SimulationOrigin;
+				float3 CapsuleEnd = Collision.CapsuleEnd - SimulationOrigin;
+				float3 AB = CapsuleEnd - CapsuleStart;
+				float3 AP = GetPredict(Predict) - CapsuleStart;
 				float t = saturate(dot(AP, AB) / SizeSquared(AB));
-				float3 Q = Collision.CapsuleStart + t * AB;
+				float3 Q = CapsuleStart + t * AB;
 
 				float3 Diff = GetPredict(Predict) - Q;
 				float DistSq = SizeSquared(Diff);
@@ -354,6 +375,7 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupThreadIndex : SV_GroupIndex)
 	{
 		PositionUAV[BatchIndex] = Position;
 		VelocityUAV[BatchIndex] = Velocity;
+		PrevAnimOriginUAV[BatchIndex] = PrevAnimOrigin;
 		SharedPosition[BatchIndex] = Position;
 	}
 

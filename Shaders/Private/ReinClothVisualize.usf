@@ -4,6 +4,7 @@
 
 float3 Color;
 float4x4 RenderMatrix;
+float3 SimulationOrigin;
 
 StructuredBuffer<float4> PositionSRV;	// xyz: pos, w: inv mass
 StructuredBuffer<uint4> TriangleSRV;	// xyz: index, w: pad
@@ -77,6 +78,8 @@ void MainVS(
 #else  // VISUALIZE_RENDER_MESH
 	float3 Position = GetPosition(PositionSRV[BatchIndex]);
 #endif  // VISUALIZE_RENDER_MESH
+
+	Position += SimulationOrigin;
 
 	// Translatedに変換
 	Position = Position + DFHackToFloat(ResolvedView.PreViewTranslation);

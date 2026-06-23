@@ -80,12 +80,17 @@ bool FReinClothInstance::Initialize(UReinClothSubsystem* ReinClothSubsystem, con
 		bIsRegisteredSharedBoneCache = true;
 	}
 
-	GridSize = ClothAsset->GridSize;
+	GridSize = ClothAsset->Sections[SectionIndex].GridSize;
+	if (GridSize <= 0)
+	{
+		// 変位の格納先を作成できない
+		return false;
+	}
 
 	if (!IsValid(RT_Position))
 	{
 		auto TextureSize = FMath::RoundUpToPowerOfTwo(GridSize);
-		RT_Position = UKismetRenderingLibrary::CreateRenderTarget2D(World, TextureSize, TextureSize, RTF_RGBA32f, FLinearColor(0.0f, 0.0f, 0.0f, 0.0f), false, true);
+		RT_Position = UKismetRenderingLibrary::CreateRenderTarget2D(World, TextureSize, TextureSize, RTF_RGBA16f, FLinearColor(0.0f, 0.0f, 0.0f, 0.0f), false, true);
 		UKismetRenderingLibrary::ClearRenderTarget2D(World, RT_Position);
 
 		// MIDのリソース更新を要求
@@ -94,7 +99,7 @@ bool FReinClothInstance::Initialize(UReinClothSubsystem* ReinClothSubsystem, con
 	if (!IsValid(RT_Normal))
 	{
 		auto TextureSize = FMath::RoundUpToPowerOfTwo(GridSize);
-		RT_Normal = UKismetRenderingLibrary::CreateRenderTarget2D(World, TextureSize, TextureSize, RTF_RGBA32f, FLinearColor(0.0f, 0.0f, 0.0f, 0.0f), false, true);
+		RT_Normal = UKismetRenderingLibrary::CreateRenderTarget2D(World, TextureSize, TextureSize, RTF_RGBA16f, FLinearColor(0.0f, 0.0f, 0.0f, 0.0f), false, true);
 		UKismetRenderingLibrary::ClearRenderTarget2D(World, RT_Normal);
 
 		// MIDのリソース更新を要求
@@ -168,7 +173,7 @@ bool FReinClothInstance::Update(UReinClothSubsystem* ReinClothSubsystem)
 	Dst.NumSubsteps = NumSubsteps;
 
 	Dst.VelocityDamping = VelocityDamping;
-
+	Dst.AnimDeltaScale = AnimDeltaScale;
 	Dst.Gravity = Gravity;
 
 	Dst.MaxDisplacement = MaxDisplacement;

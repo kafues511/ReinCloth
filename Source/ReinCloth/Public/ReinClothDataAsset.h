@@ -99,6 +99,11 @@ struct FReinClothSettings
 	float VelocityDamping = 0.99f;
 
 	/**
+	 * @brief アニメーション変位の反映率
+	 */
+	float AnimDeltaScale = 0.0f;
+
+	/**
 	 * @brief 重力
 	 */
 	FVector3f Gravity = FVector3f(0.0f, 0.0f, -100.0f);
@@ -137,6 +142,11 @@ struct FReinClothSettings
 	 * @brief LocalToWorld行列
 	 */
 	FMatrix44f RenderMatrix = FMatrix44f::Identity;
+
+	/**
+	 * @brief シミュレーション空間の原点
+	 */
+	FVector3f SimulationOrigin = FVector3f::ZeroVector;
 
 	/**
 	 * @brief ボーン行列
@@ -446,6 +456,12 @@ public:
 #endif  // WITH_EDITORONLY_DATA
 
 	/**
+	 * @brief クロスの変位を書き込むテクスチャのサイズ
+	 */
+	UPROPERTY(VisibleAnywhere, Category = "ClothSection")
+	int32 GridSize = INDEX_NONE;
+
+	/**
 	 * @brief 識別
 	 */
 	UPROPERTY(VisibleAnywhere, Category = "ClothSection")
@@ -488,7 +504,7 @@ public:
 	int32 RenderSection = INDEX_NONE;
 
 public:
-	EReinClothSetupFlags Setup(const USkeletalMesh* SkeletalRenderMeshAsset, const USkeletalMesh* SkeletalSimulationMeshAsset, int32 ClothUVChannel, float GridSize, bool bIsForce, FString& OutMessage);
+	EReinClothSetupFlags Setup(const USkeletalMesh* SkeletalRenderMeshAsset, const USkeletalMesh* SkeletalSimulationMeshAsset, int32 ClothUVChannel, float InGridSize, bool bIsForce, FString& OutMessage);
 };
 
 UCLASS(BlueprintType, Category = "ReinCloth", meta = (DisplayName = "Rein Cloth Asset"))
@@ -531,12 +547,6 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, Category = "ClothAsset", meta = (DisplayName = "Sections\nクロスの設定", TitleProperty = "UniqueName"))
 	TArray<FReinClothSimMeshSection> Sections;
-
-	/**
-	 * @brief グリッドサイズ
-	 */
-	UPROPERTY(VisibleAnywhere, Category = "ClothAsset")
-	int32 GridSize = INDEX_NONE;
 
 #if WITH_EDITORONLY_DATA
 	/**

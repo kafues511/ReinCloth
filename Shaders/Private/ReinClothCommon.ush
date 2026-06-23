@@ -18,6 +18,7 @@
 #define GetVelocity(Value) Value.xyz
 #define GetNormal(Value) Value.xyz
 #define GetOrigin(Value) Value.xyz
+#define GetPrevAnimPosition(Value) Value.xyz
 
 #define SizeSquared(Value) dot(Value, Value)
 
