@@ -561,7 +561,7 @@ void FReinClothViewExtension::Simulation_RenderThread(FRDGBuilder& GraphBuilder,
 
 	RDG_EVENT_SCOPE_STAT(GraphBuilder, ReinCloth, "ReinCloth");
 
-	auto GlobalShaderMap = GetGlobalShaderMap(InViewFamily.GetFeatureLevel());
+	auto GlobalShaderMap = GetGlobalShaderMap(InViewFamily.GetShaderPlatform());
 
 #if 0
 	auto DeltaTime = InViewFamily.Time.GetDeltaWorldTimeSeconds();
@@ -717,7 +717,7 @@ FScreenPassTexture FReinClothViewExtension::PostProcessPass_RenderThread(FRDGBui
 	const FScreenPassTextureViewport InputViewport(SceneColor);
 	const FScreenPassTextureViewport OutputViewport(InputViewport);
 
-	FGlobalShaderMap* GlobalShaderMap = GetGlobalShaderMap(View.GetFeatureLevel());
+	FGlobalShaderMap* GlobalShaderMap = GetGlobalShaderMap(View.GetShaderPlatform());
 
 	TMap<TWeakObjectPtr<USkeletalMeshComponent>, FRDGBufferSRVRef> BoneMatrixSRVs;
 	for (auto& [WeakSkeletalMeshComponent, SharedBoneResource] : SharedBoneResources)
